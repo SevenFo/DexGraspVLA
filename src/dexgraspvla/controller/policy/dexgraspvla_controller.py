@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import inspect
 from dexgraspvla.controller.model.common.normalizer import LinearNormalizer
 from dexgraspvla.controller.policy.base_image_policy import BaseImagePolicy
@@ -28,9 +27,9 @@ class DexGraspVLAController(BaseImagePolicy):
     def __init__(
         self,
         shape_meta: dict,
-        noise_scheduler: DDPMScheduler,
+        # 删除 noise_scheduler: DDPMScheduler 参数
         obs_encoder: ObsEncoder,
-        num_inference_steps=None,
+        num_inference_steps=100,  # 默认值，控制 ODE 求解步数
         # arch
         n_layer=7,
         n_head=8,
@@ -42,7 +41,7 @@ class DexGraspVLAController(BaseImagePolicy):
     ):
         super().__init__()
 
-        # parse shapes
+        # 解析形状
         action_shape = shape_meta["action"]["shape"]
         assert len(action_shape) == 1
         action_dim = action_shape[0]
@@ -67,15 +66,14 @@ class DexGraspVLAController(BaseImagePolicy):
 
         self.obs_encoder = obs_encoder
         self.model = model
-        self.noise_scheduler = noise_scheduler
+        # 移除 self.noise_scheduler = noise_scheduler
         self.normalizer = LinearNormalizer()
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.start_ckpt_path = start_ckpt_path
         self.kwargs = kwargs
 
-        if num_inference_steps is None:
-            num_inference_steps = noise_scheduler.config.num_train_timesteps
+        # 设置 ODE 求解步数
         self.num_inference_steps = num_inference_steps
 
     # ========= inference  ============
@@ -110,31 +108,78 @@ class DexGraspVLAController(BaseImagePolicy):
 
         return trajectory, all_timestep_attention_maps
 
+    def solve_ode(self, cond, gen_attn_map=False, **kwargs):
+        """
+        使用欧拉方法求解 ODE dx/dt = v(x,t)
+        从 t=1 (噪声) 积分到 t=0 (数据)
+        """
+        model = self.model
+        B = cond.shape[0]
+
+        # 1. 从 t=1 处的纯高斯噪声开始
+        x_t = torch.randn(
+            size=(B, self.action_horizon, self.action_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # 2. 定义 ODE 求解器的时间步长
+        ts = torch.linspace(1, 0, self.num_inference_steps, device=self.device)
+
+        # 存储注意力图（如果需要的话）
+        all_timestep_attention_maps = {}
+
+        # 3. ODE 积分循环
+        for i in range(self.num_inference_steps - 1):
+            t_now = ts[i]
+            t_next = ts[i + 1]
+
+            # 将 t_now 广播为模型需要的形状
+            t_now_tensor = t_now.expand(B)
+
+            # 预测向量场 v(x_t, t)
+            with torch.no_grad():
+                v_pred, attention_maps = model(
+                    sample=x_t,
+                    timestep=t_now_tensor,
+                    cond=cond,
+                    training=False,
+                    gen_attn_map=gen_attn_map,
+                )
+
+            if gen_attn_map:
+                all_timestep_attention_maps[t_now.cpu().item()] = attention_maps
+
+            # 4. 应用欧拉方法的一步积分
+            # x_next = x_now + v * dt，其中 dt = t_next - t_now（是负值）
+            dt = t_next - t_now
+            x_t = x_t + v_pred * dt
+
+        # t=0 时的 x_t 就是我们生成的样本
+        return x_t, all_timestep_attention_maps
+
     def predict_action(
         self, obs_dict: Dict[str, torch.Tensor], output_path: str = None
     ) -> Dict[str, torch.Tensor]:
         """
-        obs_dict: must include "obs" key
-        action_pred: predicted action
+        obs_dict: 必须包含 "obs" 键
+        action_pred: 预测的动作
         """
-        assert "past_action" not in obs_dict  # not implemented yet
-        # normalize input
-        # nobs = self.normalizer.normalize(obs_dict)
+        assert "past_action" not in obs_dict  # 尚未实现
         nobs = obs_dict
         B = next(iter(nobs.values())).shape[0]
 
-        # process input
+        # 处理输入
         obs_tokens = self.obs_encoder(nobs, training=False)
-        # (B, N, n_emb)
 
-        # run sampling
-        nsample, all_timestep_attention_maps = self.conditional_sample(
+        # 通过求解 ODE 运行采样
+        nsample, all_timestep_attention_maps = self.solve_ode(
             cond=obs_tokens,
             gen_attn_map=True if output_path is not None else False,
             **self.kwargs,
         )
 
-        # unnormalize prediction
+        # 反归一化预测
         assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer["action"].unnormalize(nsample)
 
@@ -200,50 +245,38 @@ class DexGraspVLAController(BaseImagePolicy):
     def compute_loss(self, batch, training=True):
         # normalize input
         assert "valid_mask" not in batch
-        # nobs = self.normalizer.normalize(batch['obs'])
         nobs = batch["obs"]
-        nactions = self.normalizer["action"].normalize(batch["action"])
-        trajectory = nactions
 
-        # process input
+        # 1. 获取干净数据 (x1) 和先验噪声 (x0)
+        x1 = self.normalizer["action"].normalize(batch["action"])
+        x0 = torch.randn_like(x1)
+
+        # 处理观察向量
         obs_tokens = self.obs_encoder(nobs, training)
-        # (B, N, n_emb)
 
-        # Sample noise that we'll add to the images
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        assignment = noise_assignment(trajectory, noise)
-        noise = noise[assignment]
+        # 2. 从 [0, 1] 均匀采样时间 t (避免精确为0的情况)
+        t = torch.rand(x1.shape[0], device=x1.device) * (1 - 1e-4) + 1e-4
 
-        # Sample a random timestep for each image
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (nactions.shape[0],),
-            device=trajectory.device,
-        ).long()
+        # 调整 t 的形状以便广播: (B, 1, 1)
+        time_expanded = t.view(-1, 1, 1)
 
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
+        # 3. 创建插值样本 x_t = (1-t) * x1 + t * x0
+        x_t = (1 - time_expanded) * x1 + time_expanded * x0
 
-        # Predict the noise residual
-        pred, _ = self.model(
-            noisy_trajectory,
-            timesteps,
+        # 4. 定义目标向量场 u_t = x0 - x1
+        u_t = x0 - x1
+
+        # 5. 使用模型预测向量场 v_t
+        v_t_pred, _ = self.model(
+            sample=x_t,
+            timestep=t,  # 直接传递 t，现在是 [0,1] 范围内的浮点数
             cond=obs_tokens,
             training=training,
             gen_attn_map=False,
         )
 
-        pred_type = self.noise_scheduler.config.prediction_type
-        if pred_type == "epsilon":
-            target = noise
-        elif pred_type == "sample":
-            target = trajectory
-        else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
-
-        loss = F.mse_loss(pred, target)
+        # 6. 计算预测向量场与目标向量场之间的 MSE 损失
+        loss = F.mse_loss(v_t_pred, u_t)
 
         return loss
 

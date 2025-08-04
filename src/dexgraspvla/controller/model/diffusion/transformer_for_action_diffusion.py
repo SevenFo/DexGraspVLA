@@ -412,9 +412,8 @@ class TransformerForActionDiffusion(ModuleAttrMixin):
         # 1. time embedding
         timesteps = timestep  # (B,)
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             timesteps = torch.tensor(
-                [timesteps], dtype=torch.long, device=sample.device
+                [timesteps], dtype=torch.float, device=sample.device
             )
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
