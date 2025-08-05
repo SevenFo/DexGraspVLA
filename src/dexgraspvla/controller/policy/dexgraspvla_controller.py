@@ -13,6 +13,7 @@ from dexgraspvla.controller.model.vision.obs_encoder import ObsEncoder
 from scipy.optimize import linear_sum_assignment
 import pickle
 
+from scripts.utils.profile_utils import profile_func
 
 # Adapted from https://github.com/lucidrains/pi-zero-pytorch/blob/e82fced40e55023a0ded22ab3bda495964353253/pi_zero_pytorch/pi_zero.py#L216
 def noise_assignment(data, noise):
@@ -130,6 +131,7 @@ class DexGraspVLAController(BaseImagePolicy):
         all_timestep_attention_maps = {}
 
         # 3. ODE 积分循环
+        # 强化学习？？？
         for i in range(self.num_inference_steps - 1):
             t_now = ts[i]
             t_next = ts[i + 1]
@@ -158,6 +160,7 @@ class DexGraspVLAController(BaseImagePolicy):
         # t=0 时的 x_t 就是我们生成的样本
         return x_t, all_timestep_attention_maps
 
+    @profile_func
     def predict_action(
         self, obs_dict: Dict[str, torch.Tensor], output_path: str = None
     ) -> Dict[str, torch.Tensor]:

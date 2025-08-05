@@ -4,7 +4,7 @@ defaults:
 
 
 name: train_dexgraspvla_controller
-_target_: controller.workspace.train_dexgraspvla_controller_workspace.TrainDexGraspVLAControllerWorkspace
+_target_: dexgraspvla.controller.workspace.train_dexgraspvla_controller_workspace.TrainDexGraspVLAControllerWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
@@ -19,7 +19,7 @@ keypoint_visible_rate: 1.0
 obs_as_cond: True
 
 policy:
-  _target_: controller.policy.dexgraspvla_controller.DexGraspVLAController
+  _target_: dexgraspvla.controller.policy.dexgraspvla_controller.DexGraspVLAController
 
   shape_meta: ${shape_meta}
   
@@ -37,7 +37,7 @@ policy:
     prediction_type: epsilon # or sample
 
   obs_encoder:
-    _target_: controller.model.vision.obs_encoder.ObsEncoder
+    _target_: dexgraspvla.controller.model.vision.obs_encoder.ObsEncoder
     shape_meta: ${shape_meta}
     model_config:
       head:
@@ -57,7 +57,7 @@ policy:
   start_ckpt_path: null
 
 ema:
-  _target_: controller.model.diffusion.ema_model.EMAModel
+  _target_: dexgraspvla.controller.model.diffusion.ema_model.EMAModel
   update_after_step: 0
   inv_gamma: 1.0
   power: 0.75

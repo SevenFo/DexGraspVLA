@@ -5,7 +5,7 @@ description = "A Vision-Language-Action Framework Towards General Dexterous Gras
 authors = [
     { name = "siky", email = "41624527+SevenFo@users.noreply.github.com" },
 ]
-requires-python = "~=3.9.0"
+requires-python = "~=3.10.0"
 dependencies = [
     "torch==2.5.1",
     "torchvision==0.20.1",
@@ -17,7 +17,7 @@ dependencies = [
     "scipy==1.9.1",
     "einops==0.4.1",
     "matplotlib==3.9.4",
-    "numba==0.53.1",
+    "numba>=0.53.1",
     "zarr==2.12.0",
     "tqdm==4.64.1",
     "datasets==2.6.1",
@@ -55,3 +55,16 @@ exclude = [
     "**/tmp/",
     "**/temp/",
 ]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
