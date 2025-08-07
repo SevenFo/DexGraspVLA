@@ -91,6 +91,7 @@ class DexGraspVLAController(BaseImagePolicy):
 
 
     # ========= inference  ============
+    # 利用 cond 辅助跳步？
     def conditional_sample(self, cond=None, gen_attn_map=True, **kwargs):
         model = self.model
         scheduler = self.noise_scheduler

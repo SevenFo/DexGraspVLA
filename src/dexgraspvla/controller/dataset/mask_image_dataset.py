@@ -17,6 +17,9 @@ import torch.nn.functional as F
 
 
 class MaskImageDataset(BaseImageDataset):
+    """MaskImageDataset
+    right_state: ..., 13(+6) 如果包含力反馈，则需要提供13+6维的数据
+    """
     def __init__(
         self,
         zarr_paths,
