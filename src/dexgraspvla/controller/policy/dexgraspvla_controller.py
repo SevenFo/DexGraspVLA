@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 import inspect
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from dexgraspvla.controller.model.common.normalizer import LinearNormalizer
 from dexgraspvla.controller.policy.base_image_policy import BaseImagePolicy
 from dexgraspvla.controller.model.diffusion.transformer_for_action_diffusion import (
@@ -28,9 +29,10 @@ class DexGraspVLAController(BaseImagePolicy):
     def __init__(
         self,
         shape_meta: dict,
-        # 删除 noise_scheduler: DDPMScheduler 参数
         obs_encoder: ObsEncoder,
-        num_inference_steps=100,  # 默认值，控制 ODE 求解步数
+        noise_scheduler: DDPMScheduler|None = None, 
+        num_inference_steps=None,  # 默认值，控制 ODE 求解步数
+        sampling_method: str = "diffusion",  # 新增参数
         # arch
         n_layer=7,
         n_head=8,
@@ -67,15 +69,26 @@ class DexGraspVLAController(BaseImagePolicy):
 
         self.obs_encoder = obs_encoder
         self.model = model
-        # 移除 self.noise_scheduler = noise_scheduler
+        self.noise_scheduler = noise_scheduler
         self.normalizer = LinearNormalizer()
         self.action_dim = action_dim
         self.action_horizon = action_horizon
         self.start_ckpt_path = start_ckpt_path
         self.kwargs = kwargs
 
-        # 设置 ODE 求解步数
+        self.sampling_method = sampling_method
+        if sampling_method == "diffusion":
+            assert noise_scheduler is not None, "Noise scheduler required for diffusion sampling."
+            if num_inference_steps is None:
+                num_inference_steps = noise_scheduler.config.num_train_timesteps
+        elif sampling_method == "flow":
+            if num_inference_steps is None:
+                num_inference_steps = 10  # default for ODE solver
+        else:
+            raise ValueError(f"Unsupported sampling_method: {sampling_method}")
+
         self.num_inference_steps = num_inference_steps
+
 
     # ========= inference  ============
     def conditional_sample(self, cond=None, gen_attn_map=True, **kwargs):
@@ -175,12 +188,21 @@ class DexGraspVLAController(BaseImagePolicy):
         # 处理输入
         obs_tokens = self.obs_encoder(nobs, training=False)
 
-        # 通过求解 ODE 运行采样
-        nsample, all_timestep_attention_maps = self.solve_ode(
-            cond=obs_tokens,
-            gen_attn_map=True if output_path is not None else False,
-            **self.kwargs,
-        )
+        # Select sampling method
+        if self.sampling_method == "diffusion":
+            nsample, all_timestep_attention_maps = self.conditional_sample(
+                cond=obs_tokens,
+                gen_attn_map=(output_path is not None),
+                **self.kwargs,
+            )
+        elif self.sampling_method == "flow":
+            nsample, all_timestep_attention_maps = self.solve_ode(
+                cond=obs_tokens,
+                gen_attn_map=(output_path is not None),
+                **self.kwargs,
+            )
+        else:
+            raise ValueError(f"Unsupported sampling_method: {self.sampling_method}")
 
         # 反归一化预测
         assert nsample.shape == (B, self.action_horizon, self.action_dim)
@@ -249,37 +271,66 @@ class DexGraspVLAController(BaseImagePolicy):
         # normalize input
         assert "valid_mask" not in batch
         nobs = batch["obs"]
-
-        # 1. 获取干净数据 (x1) 和先验噪声 (x0)
-        x1 = self.normalizer["action"].normalize(batch["action"])
-        x0 = torch.randn_like(x1)
+        nactions = self.normalizer["action"].normalize(batch["action"])
+        trajectory = nactions
 
         # 处理观察向量
         obs_tokens = self.obs_encoder(nobs, training)
+        
+        if self.sampling_method == "diffusion":
+            assert self.noise_scheduler is not None
+            noise = torch.randn_like(trajectory)
+            assignment = noise_assignment(trajectory, noise)
+            noise = noise[assignment]
 
-        # 2. 从 [0, 1] 均匀采样时间 t (避免精确为0的情况)
-        t = torch.rand(x1.shape[0], device=x1.device) * (1 - 1e-4) + 1e-4
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps,
+                (nactions.shape[0],), device=trajectory.device
+            ).long()
 
-        # 调整 t 的形状以便广播: (B, 1, 1)
-        time_expanded = t.view(-1, 1, 1)
+            noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
 
-        # 3. 创建插值样本 x_t = (1-t) * x1 + t * x0
-        x_t = (1 - time_expanded) * x1 + time_expanded * x0
+            pred, _ = self.model(
+                noisy_trajectory,
+                timesteps,
+                cond=obs_tokens,
+                training=training,
+                gen_attn_map=False
+            )
 
-        # 4. 定义目标向量场 u_t = x0 - x1
-        u_t = x0 - x1
+            pred_type = self.noise_scheduler.config.prediction_type
+            if pred_type == "epsilon":
+                target = noise
+            elif pred_type == "sample":
+                target = trajectory
+            else:
+                raise ValueError(f"Unsupported prediction type: {pred_type}")
 
-        # 5. 使用模型预测向量场 v_t
-        v_t_pred, _ = self.model(
-            sample=x_t,
-            timestep=t,  # 直接传递 t，现在是 [0,1] 范围内的浮点数
-            cond=obs_tokens,
-            training=training,
-            gen_attn_map=False,
-        )
+            loss = F.mse_loss(pred, target)
 
-        # 6. 计算预测向量场与目标向量场之间的 MSE 损失
-        loss = F.mse_loss(v_t_pred, u_t)
+        elif self.sampling_method == "flow":
+            # Uniform time sampling between 0 and 1
+            t = torch.rand(nactions.shape[0], device=nactions.device) * (1 - 1e-4) + 1e-4
+            t_expanded = t.view(-1, 1, 1)
+
+            x0 = torch.randn_like(nactions)
+            x1 = nactions
+            x_t = (1 - t_expanded) * x1 + t_expanded * x0
+
+            u_t = x0 - x1  # ground truth vector field
+
+            v_t_pred, _ = self.model(
+                sample=x_t,
+                timestep=t,
+                cond=obs_tokens,
+                training=training,
+                gen_attn_map=False,
+            )
+
+            loss = F.mse_loss(v_t_pred, u_t)
+        else:
+            raise ValueError(f"Unknown sampling_method: {self.sampling_method}")
+
 
         return loss
 
