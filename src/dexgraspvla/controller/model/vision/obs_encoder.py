@@ -15,7 +15,63 @@ feature_dim_dict = {
     "dinov2_vitg14": 1536,
 }
 
+class JointStateNet(ModuleAttrMixin):
+    def __init__(self,feature_dim):
+        super().__init__()
+        self.state_net = nn.Sequential(
+            nn.Linear(13, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, feature_dim),
+            nn.LayerNorm(feature_dim),
+        )
+    def forward(self, state_data):
+        state_feature = self.state_net(state_data)  # (B*T, feature_dim)
+        state_feature = state_feature.reshape(
+            B, T, state_feature.shape[-1]
+        )  # (B, T, feature_dim)
+        return state_feature
 
+class JointForceFeedbackStateNet(ModuleAttrMixin):
+    def __init__(self,feature_dim):
+        super().__init__()
+        self.joint_state_net = JointStateNet(feature_dim=feature_dim)
+        self.ff_state_net =  nn.Sequential(
+            nn.Linear(6, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, feature_dim),
+            nn.LayerNorm(feature_dim),
+        )
+        self.state_net = nn.Sequential(
+            nn.Linear(feature_dim*2, feature_dim),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(feature_dim, feature_dim),
+            nn.LayerNorm(feature_dim),
+        )
+        
+    def forward(self, state_data):
+        # state_data: B,T,13
+        B, T = state_data.shape[:2]
+        state_data = state_data.reshape(B * T, -1)
+        joint_feature = self.joint_state_net(state_data[...,:13])
+        ff_feature = self.ff_state_net(state_data[...,13:])
+        state_feature = self.state_net(torch.cat([joint_feature,ff_feature]),-1)  # (B*T, feature_dim)
+        state_feature = state_feature.reshape(
+            B, T, state_feature.shape[-1]
+        )  # (B, T, feature_dim)
+        return state_feature
+    
+def get_state_net(enable_force_feedback: bool = True):
+    if enable_force_feedback:
+        return JointStateNet
+    else:
+        return JointForceFeedbackStateNet
+    
 class ObsEncoder(ModuleAttrMixin):
     def __init__(
         self,
@@ -128,14 +184,7 @@ class ObsEncoder(ModuleAttrMixin):
         )
 
         # Create state_net to process robot arm and dexterous hand states
-        self.state_net = nn.Sequential(
-            nn.Linear(13, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, feature_dim),
-            nn.LayerNorm(feature_dim),
-        )
+        self.state_net = get_state_net()(feature_dim=feature_dim)
 
         self.shape_meta = shape_meta
         self.feature_dim = feature_dim
@@ -199,7 +248,9 @@ class ObsEncoder(ModuleAttrMixin):
         return wrist_feature
 
     def forward_state(self, state_data):
-        # state_data: B,T,13
+        return self.state_net(state_data)
+    
+    def forward_force_feedback(self, ff_state_data):
         B, T = state_data.shape[:2]
         state_data = state_data.reshape(B * T, -1)
         state_feature = self.state_net(state_data)  # (B*T, feature_dim)
@@ -207,7 +258,7 @@ class ObsEncoder(ModuleAttrMixin):
             B, T, state_feature.shape[-1]
         )  # (B, T, feature_dim)
         return state_feature
-
+    
     def forward(self, obs_dict, training=True):
         """
         Input:
